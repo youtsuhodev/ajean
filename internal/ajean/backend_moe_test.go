@@ -25,6 +25,102 @@ func argAfter(args []string, flag string) string {
 	return ""
 }
 
+func TestMoePlatformAssets(t *testing.T) {
+	if got := moeEngineAssetForOS("windows"); got != moeEngineWindowsAsset {
+		t.Fatalf("Windows engine asset = %q, want %q", got, moeEngineWindowsAsset)
+	}
+	if got := moeEngineLocalForOS("windows"); got != "strata-windows-x64-cuda12.zip" {
+		t.Fatalf("Windows local engine asset = %q", got)
+	}
+	if got := moeEngineURL(moeEngineWindowsAsset); got != moeEngineWindowsURL {
+		t.Fatalf("Windows engine URL = %q, want %q", got, moeEngineWindowsURL)
+	}
+	if got := moeAssetSHA[moeEngineWindowsAsset]; got != "41407c01342de44e1eebf56fed46a840941a0b8328ccbf0cded0786c96838ad6" {
+		t.Fatalf("Windows engine checksum = %q", got)
+	}
+	files := moeEngineFilesForOS("windows")
+	if len(files) != 3 || files[0] != "strata.exe" || files[1] != "strata-vision.exe" {
+		t.Fatalf("Windows engine files = %v", files)
+	}
+}
+
+func TestMoePlatformSupported(t *testing.T) {
+	for _, tc := range []struct {
+		goos, goarch string
+		want         bool
+	}{
+		{"linux", "amd64", true},
+		{"windows", "amd64", true},
+		{"windows", "arm64", false},
+		{"darwin", "amd64", false},
+	} {
+		if got := moePlatformSupported(tc.goos, tc.goarch); got != tc.want {
+			t.Errorf("%s/%s supported = %v, want %v", tc.goos, tc.goarch, got, tc.want)
+		}
+	}
+}
+
+func TestMoePythonCommandWindows(t *testing.T) {
+	bin, args := moePythonCommandForOS("windows")
+	if bin != "python" && filepath.Base(bin) != "py.exe" && filepath.Base(bin) != "py" {
+		t.Fatalf("Windows Python command = %q", bin)
+	}
+	if filepath.Base(bin) == "py.exe" || filepath.Base(bin) == "py" {
+		if len(args) != 1 || args[0] != "-3" {
+			t.Fatalf("Python launcher args = %v", args)
+		}
+	}
+	if got, want := moeVenvPythonForOS(`C:\moe`, "windows"), filepath.Join(`C:\moe`, ".venv", "Scripts", "python.exe"); got != want {
+		t.Fatalf("Windows venv Python = %q, want %q", got, want)
+	}
+	bin, args = moeServerCommandForOS("windows", `C:\moe`, `C:\moe\.venv\Scripts\python.exe`, "", `C:\moe\config.json`, "8080")
+	if bin != `C:\moe\.venv\Scripts\python.exe` || len(args) != 8 || args[1] != filepath.Join(`C:\moe`, "serve", "server.py") || args[2] != "--engine" || args[3] != "strata" {
+		t.Fatalf("Windows server command = %q %v", bin, args)
+	}
+}
+
+func TestMoeMmapConfigPlatformSpecific(t *testing.T) {
+	args, env := moeApplyMmapConfig(
+		[]string{"--resident-experts", "--pcie-frac", "0.4"},
+		map[string]any{"STRATA_ARENA_MMAP": "1"},
+		"windows",
+	)
+	if !hasArg(args, "--mmap-experts") || hasArg(args, "--resident-experts") {
+		t.Fatalf("Windows mmap flags incorrect: %v", args)
+	}
+	if _, ok := env["STRATA_ARENA_MMAP"]; ok {
+		t.Fatalf("Linux-only env leaked to Windows: %v", env)
+	}
+	args, env = moeApplyMmapConfig([]string{"--resident-experts"}, map[string]any{}, "linux")
+	if hasArg(args, "--mmap-experts") || hasArg(args, "--resident-experts") || argAfter(args, "--pcie-frac") != "0" || env["STRATA_ARENA_MMAP"] != "1" {
+		t.Fatalf("Linux mmap config changed unexpectedly: args=%v env=%v", args, env)
+	}
+}
+
+func TestMoeBuildConfigWindows(t *testing.T) {
+	base := map[string]any{
+		"args": []any{"--pack", "pack", "--resident-experts"},
+		"env":  map[string]any{"STRATA_ARENA_MMAP": "1"},
+	}
+	out, err := moeBuildConfigForOS(base, map[string]string{"MOE_MMAP": "1"}, "", "windows")
+	if err != nil {
+		t.Fatal(err)
+	}
+	args := moeArgs(t, out)
+	env := out["env"].(map[string]any)
+	if !hasArg(args, "--mmap-experts") || hasArg(args, "--resident-experts") {
+		t.Fatalf("Windows mmap args = %v", args)
+	}
+	if _, ok := env["STRATA_ARENA_MMAP"]; ok {
+		t.Fatalf("Linux-only mmap setting leaked into Windows config: %v", env)
+	}
+	for _, key := range []string{"STRATA_PLE_BATCH", "STRATA_NO_LARGEPAGES"} {
+		if _, ok := env[key]; ok {
+			t.Fatalf("Linux engine tuning %s leaked into Windows config: %v", key, env)
+		}
+	}
+}
+
 func TestMoeBuildConfigApplyTuning(t *testing.T) {
 	base := map[string]any{
 		"exe":  "/x/engine-cuda12/strata",
@@ -59,7 +155,7 @@ func TestMoeBuildConfigApplyTuning(t *testing.T) {
 func TestMoeBuildConfigHelperGPU(t *testing.T) {
 	base := map[string]any{"args": []any{"--pack", "/p", "--mmap-experts", "--vram-reserve-mib", "700"}, "gpu": 1.0,
 		"vision": map[string]any{"exe": "v", "gpu": true}}
-	out, err := moeBuildConfig(base, map[string]string{"MOE_HELPER_GPU": "0"}, "")
+	out, err := moeBuildConfigForOS(base, map[string]string{"MOE_HELPER_GPU": "0"}, "", "linux")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -90,7 +186,7 @@ func TestMoeDropFits(t *testing.T) {
 	if !moeDropFits(q, env) {
 		t.Error("serveur de test (46 Go + 3070) : le mode hors RAM devrait tenir")
 	}
-	f := moeFitFor(q, env, 0)
+	f := moeFitForOS(q, env, 0, "linux")
 	if f.Mmap || !f.Drop {
 		t.Errorf("fit = mmap %v drop %v, attendu drop", f.Mmap, f.Drop)
 	}
@@ -112,14 +208,14 @@ func TestMoeBuildConfigDrop(t *testing.T) {
 	base := map[string]any{"args": []any{"--pack", pack, "--pcie-frac", "0.3"}, "env": map[string]any{}}
 	cfg := map[string]string{"MOE_HELPER_GPU": "0", "MOE_DROP": "1", "MOE_MMAP": "0"}
 	// sans experts.bin ni moteur à jour : repli mmap (ce lancement écrit experts.bin)
-	out, _ := moeBuildConfig(base, cfg, "")
+	out, _ := moeBuildConfigForOS(base, cfg, "", "linux")
 	if out["env"].(map[string]any)["STRATA_ARENA_MMAP"] != "1" || out["env"].(map[string]any)["STRATA_REMOTE_DROP"] != nil {
 		t.Fatalf("repli mmap attendu : %v", out["env"])
 	}
 	_ = os.WriteFile(filepath.Join(pack, "experts.bin"), []byte("x"), 0o644)
 	_ = os.MkdirAll(filepath.Join(moeSrcDir(), "engine-cuda12"), 0o755)
 	_ = os.WriteFile(moeEngineMarker(), []byte(moeEngineAsset+"\n"), 0o644)
-	out, _ = moeBuildConfig(base, cfg, "")
+	out, _ = moeBuildConfigForOS(base, cfg, "", "linux")
 	e := out["env"].(map[string]any)
 	if e["STRATA_REMOTE_DROP"] != "1" || e["STRATA_ARENA_MMAP"] != nil {
 		t.Errorf("mode hors RAM attendu : %v", e)
@@ -129,7 +225,7 @@ func TestMoeBuildConfigDrop(t *testing.T) {
 	}
 	// carte d'aide coupée : pas de mode hors RAM
 	cfg["MOE_HELPER"] = "0"
-	out, _ = moeBuildConfig(base, cfg, "")
+	out, _ = moeBuildConfigForOS(base, cfg, "", "linux")
 	if out["env"].(map[string]any)["STRATA_REMOTE_DROP"] != nil {
 		t.Error("mode hors RAM sans carte d'aide")
 	}
@@ -137,7 +233,7 @@ func TestMoeBuildConfigDrop(t *testing.T) {
 
 func TestMoeBuildConfigMmap(t *testing.T) {
 	base := map[string]any{"args": []any{"--pack", "/p", "--mmap-experts"}, "env": map[string]any{"X": "1"}}
-	out, err := moeBuildConfig(base, map[string]string{"MOE_HELPER_GPU": "0"}, "")
+	out, err := moeBuildConfigForOS(base, map[string]string{"MOE_HELPER_GPU": "0"}, "", "linux")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -176,7 +272,7 @@ func TestMoeRecommend(t *testing.T) {
 	if got := moeRecommend("qwen", env); got != "IQ3_XXS" {
 		t.Errorf("qwen 47 Go : %q, attendu IQ3_XXS", got)
 	}
-	f := moeFitFor(moeQuants["IQ3_XXS"], env, 0)
+	f := moeFitForOS(moeQuants["IQ3_XXS"], env, 0, "linux")
 	// trop juste pour tout garder en RAM, mais la 3070 garde les siens : mode hors RAM
 	if !f.OK || f.Mmap || !f.Drop {
 		t.Errorf("IQ3_XXS sur 47 Go : ok=%v mmap=%v drop=%v (attendu ok, hors RAM)", f.OK, f.Mmap, f.Drop)
@@ -217,7 +313,7 @@ func TestMoeNeutral(t *testing.T) {
 
 func TestMoeBuildConfigMmapFromPreset(t *testing.T) {
 	base := map[string]any{"args": []any{"--pack", "/p"}}
-	out, err := moeBuildConfig(base, map[string]string{"MOE_MMAP": "1"}, "")
+	out, err := moeBuildConfigForOS(base, map[string]string{"MOE_MMAP": "1"}, "", "linux")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -225,7 +321,7 @@ func TestMoeBuildConfigMmapFromPreset(t *testing.T) {
 	if argAfter(a, "--pcie-frac") != "0" || out["env"].(map[string]any)["STRATA_ARENA_MMAP"] != "1" {
 		t.Errorf("MOE_MMAP=1 non appliqué : %v %v", a, out["env"])
 	}
-	out, _ = moeBuildConfig(base, map[string]string{"MOE_MMAP": "0"}, "")
+	out, _ = moeBuildConfigForOS(base, map[string]string{"MOE_MMAP": "0"}, "", "linux")
 	if out["env"].(map[string]any)["STRATA_ARENA_MMAP"] != nil {
 		t.Errorf("mmap appliqué sans MOE_MMAP : %v", out["env"])
 	}
